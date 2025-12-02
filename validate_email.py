@@ -6,165 +6,195 @@ import requests
 import dns.resolver
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Tuple
 
-# -----------------------------------------
-# GLOBAL HISTORICAL CACHES
-# -----------------------------------------
+# -------------------------
+# CACHES
+# -------------------------
 MX_CACHE = {}
-DOMAIN_CACHE = {}
 WEBSITE_CACHE = {}
 SMTP_BANNER_CACHE = {}
 SMTP_RESULT_CACHE = {}
 
-# -----------------------------------------
-# 1 — REGEX SYNTAX VALIDATION (FASTEST)
-# -----------------------------------------
+# -------------------------
+# REGEX SYNTAX
+# -------------------------
 EMAIL_REGEX = re.compile(
-    r"(^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$)"
+    r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$"
 )
 
 def validate_syntax(email: str) -> bool:
-    return EMAIL_REGEX.match(email) is not None
+    if not email or "@" not in email:
+        return False
+    return EMAIL_REGEX.match(email.strip()) is not None
 
-
-# -----------------------------------------
-# 2 — DOMAIN HEALTH CHECKS
-# -----------------------------------------
+# -------------------------
+# WEBSITE PRESENCE (convert www → https automatically)
+# -------------------------
 def check_website(domain: str) -> bool:
+    if not domain:
+        return False
+
     if domain in WEBSITE_CACHE:
         return WEBSITE_CACHE[domain]
 
-    try:
+    domain = domain.strip()
+
+    # Convert www.* or bare domain to https://www.domain or https://domain
+    if domain.startswith("www."):
+        url = "https://" + domain
+    elif not domain.startswith("http://") and not domain.startswith("https://"):
+        url = "https://" + domain
+    else:
         url = domain
-        if not url.startswith("http"):
-            url = "http://" + url
-        r = requests.get(url, timeout=5)
+
+    try:
+        r = requests.get(url, timeout=6)
         WEBSITE_CACHE[domain] = (200 <= r.status_code < 400)
         return WEBSITE_CACHE[domain]
     except:
         WEBSITE_CACHE[domain] = False
         return False
 
-
-def check_mx(domain: str):
+# -------------------------
+# MX RECORD CHECK
+# -------------------------
+def check_mx(domain: str, lifetime: float = 5.0) -> List[str]:
+    domain = domain.lower().strip()
     if domain in MX_CACHE:
         return MX_CACHE[domain]
 
     try:
-        answers = dns.resolver.resolve(domain, "MX", lifetime=4)
-        recs = [str(r.exchange).rstrip('.') for r in answers]
+        answers = dns.resolver.resolve(domain, "MX", lifetime=lifetime)
+        recs = sorted([str(r.exchange).rstrip(".") for r in answers])
         MX_CACHE[domain] = recs
         return recs
-    except:
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.resolver.Timeout, dns.exception.DNSException):
         MX_CACHE[domain] = []
         return []
 
-
-# -----------------------------------------
-# 3 — INDIRECT SMTP BANNER ANALYSIS
-# -----------------------------------------
-def smtp_banner(host: str) -> str:
-    if host in SMTP_BANNER_CACHE:
-        return SMTP_BANNER_CACHE[host]
+# -------------------------
+# SMTP BANNER
+# -------------------------
+def smtp_banner(host: str, port: int = 25, timeout: float = 6.0) -> str:
+    key = f"{host}:{port}"
+    if key in SMTP_BANNER_CACHE:
+        return SMTP_BANNER_CACHE[key]
 
     try:
-        server = smtplib.SMTP(timeout=5)
-        server.connect(host)
-        banner = server.sock.recv(1024).decode(errors="ignore")
-        server.quit()
-        SMTP_BANNER_CACHE[host] = banner
-        return banner
-    except:
-        SMTP_BANNER_CACHE[host] = ""
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            banner = sock.recv(1024).decode(errors="ignore").strip()
+            SMTP_BANNER_CACHE[key] = banner
+            return banner
+    except Exception:
+        SMTP_BANNER_CACHE[key] = ""
         return ""
 
-
-# -----------------------------------------
-# 4 — NULL SENDER RFC-COMPLIANT RCPT TEST
-# -----------------------------------------
-def smtp_null_sender(host: str, email: str) -> int:
-    key = host + "|" + email
+# -------------------------
+# NULL SENDER RCPT CHECK
+# -------------------------
+def smtp_null_sender(host: str, email: str, port: int = 25, timeout: float = 8.0) -> int:
+    key = f"{host}:{port}|{email}"
     if key in SMTP_RESULT_CACHE:
         return SMTP_RESULT_CACHE[key]
 
+    code = 0
     try:
-        server = smtplib.SMTP(host, 25, timeout=7)
-        server.helo("example.com")
-        server.mail("")
-        code, msg = server.rcpt(email)
+        server = smtplib.SMTP(host=host, port=port, timeout=timeout)
+        server.set_debuglevel(0)
+        try:
+            server.ehlo()
+        except Exception:
+            try:
+                server.helo()
+            except Exception:
+                pass
+        server.mail('')
+        rcpt = server.rcpt(email)
+        if isinstance(rcpt, tuple) and len(rcpt) >= 1:
+            raw_code = rcpt[0]
+            try:
+                code = int(raw_code)
+            except Exception:
+                try:
+                    code = int(raw_code.decode() if isinstance(raw_code, bytes) else raw_code)
+                except Exception:
+                    code = 0
         server.quit()
-        SMTP_RESULT_CACHE[key] = code
-        return code
-    except:
-        SMTP_RESULT_CACHE[key] = 0
-        return 0
+    except Exception:
+        code = 0
 
+    SMTP_RESULT_CACHE[key] = code
+    return code
 
-# -----------------------------------------
-# 5 — SMART HEURISTICS ENGINE
-# -----------------------------------------
-def heuristics(banner: str, rcpt_code: int) -> str:
-    b = banner.lower()
+# -------------------------
+# HEURISTICS
+# -------------------------
+def heuristics(banner: str, rcpt_code: int, website_up: bool) -> str:
+    b = (banner or "").lower()
+    if rcpt_code is None:
+        rcpt_code = 0
 
-    # Gmail fingerprint
-    if "google" in b:
+    if "google" in b or "gmail" in b:
         if rcpt_code == 250: return "alive"
-        if rcpt_code in [550, 551, 553]: return "dead"
-        return "unknown"
+        if rcpt_code in (550, 551, 553): return "dead"
+        return "unknown" if not website_up else "likely_alive"
 
-    # Outlook fingerprint
-    if "outlook" in b or "microsoft" in b:
+    if "outlook" in b or "microsoft" in b or "hotmail" in b:
         if rcpt_code == 250: return "alive"
-        if rcpt_code == 550: return "dead"
-        return "unknown"
+        if rcpt_code in (550, 551, 553): return "dead"
+        return "unknown" if not website_up else "likely_alive"
 
-    # Generic patterns
-    if rcpt_code == 250: return "alive"
-    if rcpt_code in [550, 551, 552, 553]: return "dead"
-
+    if rcpt_code == 250:
+        return "alive"
+    if rcpt_code in (550, 551, 552, 553):
+        return "dead"
+    if website_up and rcpt_code == 0:
+        return "likely_alive"
     return "unknown"
 
+# -------------------------
+# FULL PIPELINE
+# -------------------------
+def validate_email_pipeline(email: str, web: str = None) -> Tuple[str, str]:
+    email = (email or "").strip()
+    web = (web or "").strip()
 
-# -----------------------------------------
-# 6 — FULL PIPELINE VALIDATOR
-# -----------------------------------------
-def validate_email_pipeline(email: str, web: str = None):
-    # Stage 1 — Syntax
     if not validate_syntax(email):
         return "fail", "bad_syntax"
 
-    domain = email.split("@")[-1].strip()
+    domain = email.split("@")[-1].strip().lower()
+    if not domain:
+        return "fail", "bad_domain"
 
-    # Stage 2 — Website Presence
+    website_up = False
     if web:
-        if not check_website(web):
-            return "fail", "website_down"
+        website_up = check_website(web)
 
-    # Stage 3 — Domain MX Check
     mx = check_mx(domain)
-    if not mx:
-        return "fail", "no_mx"
+    fallback_hosts = mx if mx else [domain]
 
-    mx_host = mx[0]
+    banner = ""
+    rcpt_code = 0
+    for host in fallback_hosts:
+        banner = smtp_banner(host)
+        rcpt_code = smtp_null_sender(host, email)
+        if rcpt_code in (250, 550, 551, 552, 553):
+            break
 
-    # Stage 4 — SMTP Banner
-    banner = smtp_banner(mx_host)
+    decision = heuristics(banner, rcpt_code, website_up)
 
-    # Stage 5 — Null Sender RCPT
-    rcpt_code = smtp_null_sender(mx_host, email)
-
-    # Stage 6 — Smart Heuristics
-    decision = heuristics(banner, rcpt_code)
-
-    if decision == "alive":
-        return "pass", ""
+    if website_up and mx and rcpt_code == 250:
+        return "pass", "website_up_mx_rcpt250"
+    if decision == "alive" or decision == "likely_alive":
+        return "pass", decision
     return "fail", decision
 
-
-# -----------------------------------------
-# 7 — BULK CSV PROCESSOR (MULTITHREADED)
-# -----------------------------------------
-def process_row(row):
+# -------------------------
+# CSV / Bulk
+# -------------------------
+def process_row(row: dict) -> dict:
     email = row.get("Email", "").strip()
     web = row.get("Web Address", "").strip()
     status, reason = validate_email_pipeline(email, web)
@@ -172,27 +202,27 @@ def process_row(row):
     row["Validation Reason"] = reason
     return row
 
-
-def process_csv(input_file, pass_file="pass.csv", fail_file="fail.csv", workers=25):
+def process_csv(input_file: str, pass_file: str = "pass.csv", fail_file: str = "fail.csv", workers: int = 10):
     with open(input_file, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        headers = reader.fieldnames + ["Validation Status", "Validation Reason"]
+        headers = list(reader.fieldnames or []) + ["Validation Status", "Validation Reason"]
         rows = list(reader)
 
     pass_rows = []
     fail_rows = []
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = {ex.submit(process_row, row): row for row in rows}
-
-        for fut in tqdm(as_completed(futures), total=len(rows), desc="Validating"):
-            result = fut.result()
-            if result["Validation Status"] == "pass":
+        futures = [ex.submit(process_row, row) for row in rows]
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="Validating"):
+            try:
+                result = fut.result()
+            except Exception as e:
+                result = {"Email": "", "Web Address": "", "Validation Status": "fail", "Validation Reason": f"exception:{e}"}
+            if result.get("Validation Status") == "pass":
                 pass_rows.append(result)
             else:
                 fail_rows.append(result)
 
-    # Save results
     with open(pass_file, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=headers)
         writer.writeheader()
@@ -203,15 +233,10 @@ def process_csv(input_file, pass_file="pass.csv", fail_file="fail.csv", workers=
         writer.writeheader()
         writer.writerows(fail_rows)
 
-    print(f"\n✓ Completed.")
-    print(f"Passed: {len(pass_rows)}")
-    print(f"Failed: {len(fail_rows)}")
-    print(f"Output → {pass_file}, {fail_file}")
+    print(f"\n✓ Completed. Passed: {len(pass_rows)}  Failed: {len(fail_rows)}")
+    print(f"Outputs → {pass_file}, {fail_file}")
 
-
-# -----------------------------------------
 # CLI
-# -----------------------------------------
 if __name__ == "__main__":
-    filename = input("Enter CSV filename: ").strip()
-    process_csv(filename)
+    fname = input("Enter CSV filename: ").strip()
+    process_csv(fname)
