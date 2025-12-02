@@ -4,3 +4,5 @@ dist
 MANIFEST
 *.egg-info
 magementleads.csv
+pass.csv
+fail.cssv
